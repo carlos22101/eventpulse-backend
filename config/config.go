@@ -10,12 +10,12 @@ import (
 )
 
 type Config struct {
-	Port    string
-	Env     string
-	DB      DBConfig
-	Redis   RedisConfig
-	JWT     JWTConfig
-	WS      WSConfig
+	Port  string
+	Env   string
+	DB    DBConfig
+	Redis RedisConfig
+	JWT   JWTConfig
+	WS    WSConfig
 }
 
 type DBConfig struct {
@@ -44,20 +44,17 @@ type WSConfig struct {
 }
 
 func (d DBConfig) DSN() string {
-	return fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		d.Host, d.Port, d.User, d.Password, d.Name, d.SSLMode,
-	)
+	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		d.Host, d.Port, d.User, d.Password, d.Name, d.SSLMode)
 }
 
 func Load() *Config {
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, reading from environment variables")
+		log.Println("No .env file found, using environment variables")
 	}
-
 	redisDB, _ := strconv.Atoi(getEnv("REDIS_DB", "0"))
 	jwtExp, _ := strconv.Atoi(getEnv("JWT_EXPIRATION_HOURS", "24"))
-	wsMaxMsg, _ := strconv.ParseInt(getEnv("WS_MAX_MESSAGE_SIZE", "1024"), 10, 64)
+	wsMaxMsg, _ := strconv.ParseInt(getEnv("WS_MAX_MESSAGE_SIZE", "2048"), 10, 64)
 	wsPong, _ := strconv.Atoi(getEnv("WS_PONG_WAIT_SECONDS", "60"))
 
 	return &Config{
@@ -88,11 +85,11 @@ func Load() *Config {
 }
 
 func getEnv(key, fallback string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
 	if fallback == "" {
-		log.Printf("WARNING: environment variable %s is not set", key)
+		log.Printf("WARNING: %s no configurado", key)
 	}
 	return fallback
 }

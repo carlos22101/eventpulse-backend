@@ -22,9 +22,7 @@ import (
 )
 
 func main() {
-	// ── Cargar configuración ──────────────────────────────────────────────────
 	cfg := config.Load()
-
 	if cfg.Env == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -35,10 +33,12 @@ func main() {
 	defer postgres.Close()
 
 	// ── Repositorios ──────────────────────────────────────────────────────────
-	usuarioRepo := repository.NewUsuarioRepository(postgres)
-	incidenciaRepo := repository.NewIncidenciaRepository(postgres)
-	tareaRepo := repository.NewTareaRepository(postgres)
-	mensajeRepo := repository.NewMensajeRepository(postgres)
+	usuarioRepo := repository.NewUsuarioRepo(postgres)
+	eventoRepo := repository.NewEventoRepo(postgres)
+	zonaRepo := repository.NewZonaRepo(postgres)
+	incidenciaRepo := repository.NewIncidenciaRepo(postgres)
+	tareaRepo := repository.NewTareaRepo(postgres)
+	mensajeRepo := repository.NewMensajeRepo(postgres)
 
 	// ── Servicios ─────────────────────────────────────────────────────────────
 	jwtSvc := auth.NewJWTService(cfg)
@@ -50,73 +50,87 @@ func main() {
 	go hub.Run(ctx)
 
 	// ── Handlers ──────────────────────────────────────────────────────────────
-	authHandler := handlers.NewAuthHandler(usuarioRepo, jwtSvc)
-	incidenciaHandler := handlers.NewIncidenciaHandler(incidenciaRepo, hub)
-	tareaHandler := handlers.NewTareaHandler(tareaRepo, hub)
-	chatHandler := handlers.NewChatHandler(mensajeRepo, usuarioRepo, hub)
-	wsHandler := handlers.NewWSHandler(hub, jwtSvc)
+	authH := handlers.NewAuthHandler(usuarioRepo, eventoRepo, jwtSvc)
+	eventoH := handlers.NewEventoHandler(eventoRepo, usuarioRepo, hub)
+	usuarioH := handlers.NewUsuarioHandler(usuarioRepo, eventoRepo)
+	zonaH := handlers.NewZonaHandler(zonaRepo, eventoRepo)
+	incidenciaH := handlers.NewIncidenciaHandler(incidenciaRepo, eventoRepo, hub)
+	tareaH := handlers.NewTareaHandler(tareaRepo, eventoRepo, hub)
+	chatH := handlers.NewChatHandler(mensajeRepo, eventoRepo, hub)
+	wsH := handlers.NewWSHandler(hub, jwtSvc, eventoRepo)
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	r := gin.New()
-	r.Use(gin.Logger())
-	r.Use(gin.Recovery())
-
-	// CORS - permitir Android y web
+	r.Use(gin.Logger(), gin.Recovery())
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
-		ExposeHeaders:    []string{"Content-Length"},
-		AllowCredentials: false,
-		MaxAge:           12 * time.Hour,
+		AllowOrigins:  []string{"*"},
+		AllowMethods:  []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowHeaders:  []string{"Origin", "Content-Type", "Authorization"},
+		ExposeHeaders: []string{"Content-Length"},
+		MaxAge:        12 * time.Hour,
 	}))
 
-	// Health check
+	// Health check público
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"status":  "ok",
-			"version": "1.0.0",
-		})
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "version": "2.0.0"})
 	})
 
-	// ── Rutas públicas ────────────────────────────────────────────────────────
+	// WebSocket — auth por query param ?token=
+	r.GET("/ws", wsH.Conectar)
+
+	// ── API v1 ────────────────────────────────────────────────────────────────
 	api := r.Group("/api/v1")
+
+	// ── Rutas públicas ────────────────────────────────────────────────────────
+	api.POST("/auth/login", authH.Login)
+
+	// ── Rutas protegidas (cualquier usuario autenticado) ──────────────────────
+	auth := api.Group("")
+	auth.Use(middleware.Auth(jwtSvc))
 	{
-		api.POST("/auth/login", authHandler.Login)
+		// Perfil propio
+		auth.GET("/auth/me", authH.Me)
+
+		// Eventos — admin ve todos, trabajador ve solo el suyo
+		auth.GET("/eventos", eventoH.Listar)
+
+		// Zonas
+		auth.GET("/zonas", zonaH.Listar)
+
+		// Incidencias — todos pueden ver y editar estado
+		auth.GET("/incidencias", incidenciaH.Listar)
+		auth.GET("/incidencias/:id", incidenciaH.ObtenerPorID)
+		auth.PATCH("/incidencias/:id", incidenciaH.Editar)
+
+		// Tareas — todos pueden ver y editar estado
+		auth.GET("/tareas", tareaH.Listar)
+		auth.GET("/tareas/:id", tareaH.ObtenerPorID)
+		auth.PATCH("/tareas/:id", tareaH.Editar)
+
+		// Chat — admin y trabajadores
+		auth.GET("/chat/historial", chatH.Historial)
+		auth.POST("/chat/mensaje", chatH.Enviar)
 	}
 
-	// ── WebSocket (auth por query param) ─────────────────────────────────────
-	r.GET("/ws", wsHandler.Conectar)
-
-	// ── Rutas protegidas ──────────────────────────────────────────────────────
-	protected := api.Group("")
-	protected.Use(middleware.Auth(jwtSvc))
+	// ── Rutas solo admin ──────────────────────────────────────────────────────
+	admin := api.Group("")
+	admin.Use(middleware.Auth(jwtSvc), middleware.SoloAdmin())
 	{
-		// Perfil
-		protected.GET("/auth/me", authHandler.Me)
+		// Gestión de eventos
+		admin.POST("/eventos", eventoH.Crear)
+		admin.PATCH("/eventos/:id/terminar", eventoH.Terminar)
 
-		// Incidencias
-		incidencias := protected.Group("/incidencias")
-		{
-			incidencias.GET("", incidenciaHandler.Listar)
-			incidencias.POST("", incidenciaHandler.Reportar)
-			incidencias.PATCH("/:id/atender", incidenciaHandler.Atender)
-			incidencias.PATCH("/:id/resolver", incidenciaHandler.Resolver)
-		}
+		// Gestión de usuarios (crear staff)
+		admin.POST("/usuarios", usuarioH.Crear)
+		admin.GET("/usuarios", usuarioH.Listar)
 
-		// Tareas
-		tareas := protected.Group("/tareas")
-		{
-			tareas.GET("", tareaHandler.Listar)
-			tareas.PATCH("/:id/completar", tareaHandler.Completar)
-		}
+		// Gestión de zonas
+		admin.POST("/zonas", zonaH.Crear)
+		admin.DELETE("/zonas/:id", zonaH.Eliminar)
 
-		// Chat
-		chat := protected.Group("/chat")
-		{
-			chat.GET("/historial", chatHandler.Historial)
-			chat.POST("/mensaje", chatHandler.Enviar)
-		}
+		// Crear incidencias y tareas (solo admin)
+		admin.POST("/incidencias", incidenciaH.Crear)
+		admin.POST("/tareas", tareaH.Crear)
 	}
 
 	// ── Servidor con graceful shutdown ────────────────────────────────────────
@@ -128,28 +142,23 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Arrancar servidor en goroutine
 	go func() {
-		fmt.Printf("🚀 EventPulse backend corriendo en puerto %s\n", cfg.Port)
+		fmt.Printf("🚀 EventPulse v2 corriendo en puerto %s\n", cfg.Port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Error servidor: %v", err)
 		}
 	}()
 
-	// Esperar señal de shutdown (SIGINT o SIGTERM de Docker/AWS)
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
 	fmt.Println("⏳ Apagando servidor...")
-	cancel() // Detener el hub de WebSocket
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("Error en graceful shutdown: %v", err)
+	cancel()
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutCancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Fatalf("Shutdown error: %v", err)
 	}
-
-	fmt.Println("✅ Servidor apagado correctamente")
+	fmt.Println("✅ Servidor apagado")
 }

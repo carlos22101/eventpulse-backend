@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"fmt"
 	"net/http"
 	"strings"
 
@@ -13,267 +12,483 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ─── Auth Handler ─────────────────────────────────────────────────────────────
+// ─── Auth ─────────────────────────────────────────────────────────────────────
 
 type AuthHandler struct {
-	usuarioRepo *repository.UsuarioRepository
-	jwtSvc     *auth.JWTService
+	usuarioRepo *repository.UsuarioRepo
+	eventoRepo  *repository.EventoRepo
+	jwtSvc      *auth.JWTService
 }
 
-func NewAuthHandler(r *repository.UsuarioRepository, j *auth.JWTService) *AuthHandler {
-	return &AuthHandler{usuarioRepo: r, jwtSvc: j}
+func NewAuthHandler(u *repository.UsuarioRepo, e *repository.EventoRepo, j *auth.JWTService) *AuthHandler {
+	return &AuthHandler{usuarioRepo: u, eventoRepo: e, jwtSvc: j}
 }
 
+// POST /api/v1/auth/login
 func (h *AuthHandler) Login(c *gin.Context) {
 	var req models.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
 		return
 	}
-
-	usuario, err := h.usuarioRepo.BuscarPorEmail(c.Request.Context(), req.Email)
-	if err != nil || usuario == nil {
+	usuario, err := h.usuarioRepo.BuscarPorNombreUsuario(c.Request.Context(), req.NombreUsuario)
+	if err != nil || usuario == nil || !h.usuarioRepo.ValidarPassword(usuario.Password, req.Password) {
 		c.JSON(http.StatusUnauthorized, models.ErrorResponse{Error: "Credenciales inválidas"})
 		return
 	}
-
-	if !h.usuarioRepo.ValidarPassword(usuario.Password, req.Password) {
-		c.JSON(http.StatusUnauthorized, models.ErrorResponse{Error: "Credenciales inválidas"})
-		return
-	}
-
 	token, err := h.jwtSvc.GenerarToken(usuario)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error generando token"})
 		return
 	}
-
-	usuario.Password = "" // No enviar el hash
+	usuario.Password = ""
 	c.JSON(http.StatusOK, models.LoginResponse{Token: token, Usuario: *usuario})
 }
 
+// GET /api/v1/auth/me
 func (h *AuthHandler) Me(c *gin.Context) {
-	usuarioID := middleware.GetUsuarioID(c)
-	usuario, err := h.usuarioRepo.BuscarPorID(c.Request.Context(), usuarioID)
-	if err != nil || usuario == nil {
+	u, err := h.usuarioRepo.BuscarPorID(c.Request.Context(), middleware.GetUsuarioID(c))
+	if err != nil || u == nil {
 		c.JSON(http.StatusNotFound, models.ErrorResponse{Error: "Usuario no encontrado"})
 		return
 	}
-	usuario.Password = ""
-	c.JSON(http.StatusOK, usuario)
+	u.Password = ""
+	c.JSON(http.StatusOK, u)
 }
 
-// ─── Incidencia Handler ───────────────────────────────────────────────────────
+// ─── Evento ───────────────────────────────────────────────────────────────────
 
-type IncidenciaHandler struct {
-	repo *repository.IncidenciaRepository
-	hub  *ws.Hub
+type EventoHandler struct {
+	eventoRepo  *repository.EventoRepo
+	usuarioRepo *repository.UsuarioRepo
+	hub         *ws.Hub
 }
 
-func NewIncidenciaHandler(r *repository.IncidenciaRepository, h *ws.Hub) *IncidenciaHandler {
-	return &IncidenciaHandler{repo: r, hub: h}
+func NewEventoHandler(e *repository.EventoRepo, u *repository.UsuarioRepo, h *ws.Hub) *EventoHandler {
+	return &EventoHandler{eventoRepo: e, usuarioRepo: u, hub: h}
 }
 
-func (h *IncidenciaHandler) Listar(c *gin.Context) {
-	eventoID := middleware.GetEventoID(c)
-	items, err := h.repo.Listar(c.Request.Context(), eventoID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error listando incidencias"})
+// GET /api/v1/eventos  (admin: todos | trabajador: solo el activo vinculado)
+func (h *EventoHandler) Listar(c *gin.Context) {
+	ctx := c.Request.Context()
+	if middleware.GetRol(c) == models.RolAdmin {
+		lista, err := h.eventoRepo.Listar(ctx)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error listando eventos"})
+			return
+		}
+		c.JSON(http.StatusOK, lista)
 		return
 	}
-	c.JSON(http.StatusOK, items)
+	// Trabajador: devolver solo el evento al que está vinculado
+	eventoID := middleware.GetEventoID(c)
+	if eventoID == "" {
+		c.JSON(http.StatusOK, []models.Evento{})
+		return
+	}
+	evento, err := h.eventoRepo.ObtenerActivo(ctx)
+	if err != nil || evento == nil {
+		c.JSON(http.StatusOK, []models.Evento{})
+		return
+	}
+	c.JSON(http.StatusOK, []models.Evento{*evento})
 }
 
-func (h *IncidenciaHandler) Reportar(c *gin.Context) {
-	var req models.ReportarIncidenciaRequest
+// POST /api/v1/eventos  [solo admin]
+func (h *EventoHandler) Crear(c *gin.Context) {
+	var req models.CrearEventoRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
 		return
 	}
-
-	usuarioID := middleware.GetUsuarioID(c)
-	eventoID := middleware.GetEventoID(c)
-
-	nueva, err := h.repo.Crear(c.Request.Context(), &models.Incidencia{
-		EventoID:    eventoID,
-		ZonaID:      req.ZonaID,
-		Tipo:        req.Tipo,
-		Descripcion: req.Descripcion,
-		ReportadaPor: usuarioID,
-	})
+	evento, err := h.eventoRepo.Crear(c.Request.Context(), &req, middleware.GetUsuarioID(c))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error creando incidencia"})
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error creando evento"})
 		return
 	}
-
-	// Publicar a todos los clientes del evento via Redis → WebSocket
-	go h.hub.PublicarEvento(c.Request.Context(), eventoID, models.EventoWS{
-		Tipo:     models.WSIncidenciaNueva,
-		Payload:  nueva,
-		EventoID: eventoID,
-	})
-
-	c.JSON(http.StatusCreated, nueva)
+	c.JSON(http.StatusCreated, evento)
 }
 
-// Atender implementa el flujo optimista con manejo de conflictos.
-// El cliente ya actualizó su UI; si falla, recibe un evento de rollback por WS.
-func (h *IncidenciaHandler) Atender(c *gin.Context) {
-	incID := c.Param("id")
-	usuarioID := middleware.GetUsuarioID(c)
-	eventoID := middleware.GetEventoID(c)
+// PATCH /api/v1/eventos/:id/terminar  [solo admin]
+func (h *EventoHandler) Terminar(c *gin.Context) {
+	eventoID := c.Param("id")
 	ctx := c.Request.Context()
 
-	actualizada, err := h.repo.AtenderConLock(ctx, incID, usuarioID)
-	if err != nil {
-		// Detectar conflicto de concurrencia
-		if strings.HasPrefix(err.Error(), "incidencia_conflicto:") {
-			partes := strings.SplitN(err.Error(), ":", 2)
-			quien := "otro usuario"
-			if len(partes) == 2 {
-				quien = partes[1]
-			}
-
-			// Enviar rollback SOLO al usuario que falló
-			go h.hub.PublicarAUsuario(ctx, eventoID, usuarioID, models.EventoWS{
-				Tipo: models.WSIncidenciaConflicto,
-				Payload: models.ConflictoPayload{
-					IncidenciaID: incID,
-					Mensaje:      fmt.Sprintf("La incidencia ya fue tomada por %s", quien),
-					AtendidaPor:  quien,
-				},
-				EventoID: eventoID,
-			})
-
-			c.JSON(http.StatusConflict, models.ErrorResponse{
-				Error:  fmt.Sprintf("Conflicto: ya fue tomada por %s", quien),
-				Codigo: http.StatusConflict,
-			})
-			return
-		}
-
-		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: err.Error()})
-		return
-	}
-
-	// Éxito: notificar a TODOS que la incidencia cambió de estado
-	go h.hub.PublicarEvento(ctx, eventoID, models.EventoWS{
-		Tipo:     models.WSIncidenciaActualizada,
-		Payload:  actualizada,
-		EventoID: eventoID,
-	})
-
-	c.JSON(http.StatusOK, actualizada)
-}
-
-func (h *IncidenciaHandler) Resolver(c *gin.Context) {
-	incID := c.Param("id")
-	usuarioID := middleware.GetUsuarioID(c)
-	eventoID := middleware.GetEventoID(c)
-	ctx := c.Request.Context()
-
-	actualizada, err := h.repo.Resolver(ctx, incID, usuarioID)
-	if err != nil {
-		c.JSON(http.StatusForbidden, models.ErrorResponse{Error: err.Error()})
-		return
-	}
-
-	go h.hub.PublicarEvento(ctx, eventoID, models.EventoWS{
-		Tipo:     models.WSIncidenciaActualizada,
-		Payload:  actualizada,
-		EventoID: eventoID,
-	})
-
-	c.JSON(http.StatusOK, actualizada)
-}
-
-// ─── Tarea Handler ────────────────────────────────────────────────────────────
-
-type TareaHandler struct {
-	repo *repository.TareaRepository
-	hub  *ws.Hub
-}
-
-func NewTareaHandler(r *repository.TareaRepository, h *ws.Hub) *TareaHandler {
-	return &TareaHandler{repo: r, hub: h}
-}
-
-func (h *TareaHandler) Listar(c *gin.Context) {
-	eventoID := middleware.GetEventoID(c)
-	tareas, err := h.repo.Listar(c.Request.Context(), eventoID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error listando tareas"})
-		return
-	}
-	c.JSON(http.StatusOK, tareas)
-}
-
-func (h *TareaHandler) Completar(c *gin.Context) {
-	tareaID := c.Param("id")
-	usuarioID := middleware.GetUsuarioID(c)
-	eventoID := middleware.GetEventoID(c)
-	ctx := c.Request.Context()
-
-	tarea, err := h.repo.Completar(ctx, tareaID, usuarioID)
+	evento, err := h.eventoRepo.Terminar(ctx, eventoID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
 		return
 	}
 
-	go h.hub.PublicarEvento(ctx, eventoID, models.EventoWS{
-		Tipo:     models.WSTareaActualizada,
-		Payload:  tarea,
+	// Notificar a todos los conectados que el evento terminó
+	go h.hub.Publicar(ctx, eventoID, models.EventoWS{
+		Tipo:     models.WSEventoTerminado,
+		Payload:  evento,
 		EventoID: eventoID,
 	})
 
+	c.JSON(http.StatusOK, evento)
+}
+
+// ─── Usuario ──────────────────────────────────────────────────────────────────
+
+type UsuarioHandler struct {
+	usuarioRepo *repository.UsuarioRepo
+	eventoRepo  *repository.EventoRepo
+}
+
+func NewUsuarioHandler(u *repository.UsuarioRepo, e *repository.EventoRepo) *UsuarioHandler {
+	return &UsuarioHandler{usuarioRepo: u, eventoRepo: e}
+}
+
+// POST /api/v1/usuarios  [solo admin]
+// Crea el usuario y lo vincula automáticamente al evento activo
+func (h *UsuarioHandler) Crear(c *gin.Context) {
+	var req models.CrearUsuarioRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
+		return
+	}
+	if !req.Rol.EsValido() || req.Rol == models.RolAdmin {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Error: "Rol inválido. Válidos: aseo, guardia, medico, logistica, supervisor",
+		})
+		return
+	}
+
+	// Obtener evento activo para vincular
+	evento, err := h.eventoRepo.ObtenerActivo(c.Request.Context())
+	if err != nil || evento == nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "No hay ningún evento activo. Crea un evento primero"})
+		return
+	}
+
+	usuario, err := h.usuarioRepo.Crear(c.Request.Context(), &req, evento.ID)
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
+			c.JSON(http.StatusConflict, models.ErrorResponse{Error: "El nombre de usuario ya existe"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error creando usuario"})
+		return
+	}
+	c.JSON(http.StatusCreated, usuario)
+}
+
+// GET /api/v1/usuarios  [solo admin]
+func (h *UsuarioHandler) Listar(c *gin.Context) {
+	eventoID := middleware.GetEventoID(c)
+	// Admin puede pasar ?evento_id= para ver de otro evento
+	if qID := c.Query("evento_id"); qID != "" && middleware.GetRol(c) == models.RolAdmin {
+		eventoID = qID
+	}
+	if eventoID == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "Se requiere evento_id"})
+		return
+	}
+	lista, err := h.usuarioRepo.Listar(c.Request.Context(), eventoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error listando usuarios"})
+		return
+	}
+	c.JSON(http.StatusOK, lista)
+}
+
+// ─── Zona ─────────────────────────────────────────────────────────────────────
+
+type ZonaHandler struct {
+	zonaRepo   *repository.ZonaRepo
+	eventoRepo *repository.EventoRepo
+}
+
+func NewZonaHandler(z *repository.ZonaRepo, e *repository.EventoRepo) *ZonaHandler {
+	return &ZonaHandler{zonaRepo: z, eventoRepo: e}
+}
+
+// GET /api/v1/zonas
+func (h *ZonaHandler) Listar(c *gin.Context) {
+	eventoID := middleware.GetEventoID(c)
+	if qID := c.Query("evento_id"); qID != "" && middleware.GetRol(c) == models.RolAdmin {
+		eventoID = qID
+	}
+	lista, err := h.zonaRepo.Listar(c.Request.Context(), eventoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error listando zonas"})
+		return
+	}
+	c.JSON(http.StatusOK, lista)
+}
+
+// POST /api/v1/zonas  [solo admin]
+func (h *ZonaHandler) Crear(c *gin.Context) {
+	var req models.CrearZonaRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
+		return
+	}
+	// Obtener evento activo
+	evento, err := h.eventoRepo.ObtenerActivo(c.Request.Context())
+	if err != nil || evento == nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "No hay evento activo"})
+		return
+	}
+	zona, err := h.zonaRepo.Crear(c.Request.Context(), &req, evento.ID)
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
+			c.JSON(http.StatusConflict, models.ErrorResponse{Error: "Ya existe una zona con ese ID en este evento"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error creando zona"})
+		return
+	}
+	c.JSON(http.StatusCreated, zona)
+}
+
+// DELETE /api/v1/zonas/:id  [solo admin]
+func (h *ZonaHandler) Eliminar(c *gin.Context) {
+	zonaID := c.Param("id")
+	evento, err := h.eventoRepo.ObtenerActivo(c.Request.Context())
+	if err != nil || evento == nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "No hay evento activo"})
+		return
+	}
+	if err := h.zonaRepo.Eliminar(c.Request.Context(), zonaID, evento.ID); err != nil {
+		c.JSON(http.StatusNotFound, models.ErrorResponse{Error: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"mensaje": "Zona eliminada"})
+}
+
+// ─── Incidencia ───────────────────────────────────────────────────────────────
+
+type IncidenciaHandler struct {
+	repo       *repository.IncidenciaRepo
+	eventoRepo *repository.EventoRepo
+	hub        *ws.Hub
+}
+
+func NewIncidenciaHandler(r *repository.IncidenciaRepo, e *repository.EventoRepo, h *ws.Hub) *IncidenciaHandler {
+	return &IncidenciaHandler{repo: r, eventoRepo: e, hub: h}
+}
+
+// GET /api/v1/incidencias
+func (h *IncidenciaHandler) Listar(c *gin.Context) {
+	eventoID := middleware.GetEventoID(c)
+	if eventoID == "" {
+		if ev, _ := h.eventoRepo.ObtenerActivo(c.Request.Context()); ev != nil {
+			eventoID = ev.ID
+		}
+	}
+	lista, err := h.repo.Listar(c.Request.Context(), eventoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error listando incidencias"})
+		return
+	}
+	c.JSON(http.StatusOK, lista)
+}
+
+// GET /api/v1/incidencias/:id
+func (h *IncidenciaHandler) ObtenerPorID(c *gin.Context) {
+	inc, err := h.repo.ObtenerPorID(c.Request.Context(), c.Param("id"))
+	if err != nil || inc == nil {
+		c.JSON(http.StatusNotFound, models.ErrorResponse{Error: "Incidencia no encontrada"})
+		return
+	}
+	c.JSON(http.StatusOK, inc)
+}
+
+// POST /api/v1/incidencias  [solo admin]
+func (h *IncidenciaHandler) Crear(c *gin.Context) {
+	var req models.CrearIncidenciaRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	evento, err := h.eventoRepo.ObtenerActivo(ctx)
+	if err != nil || evento == nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "No hay evento activo"})
+		return
+	}
+	inc, err := h.repo.Crear(ctx, &req, evento.ID, middleware.GetUsuarioID(c))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error creando incidencia"})
+		return
+	}
+	// Notificar a todos por WS
+	go h.hub.Publicar(ctx, evento.ID, models.EventoWS{
+		Tipo:     models.WSIncidenciaNueva,
+		Payload:  inc,
+		EventoID: evento.ID,
+	})
+	c.JSON(http.StatusCreated, inc)
+}
+
+// PATCH /api/v1/incidencias/:id  (trabajador cambia estado | admin puede reasignar)
+func (h *IncidenciaHandler) Editar(c *gin.Context) {
+	var req models.EditarIncidenciaRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	inc, err := h.repo.Editar(ctx, c.Param("id"), &req, middleware.GetUsuarioID(c))
+	if err != nil || inc == nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "Error editando incidencia"})
+		return
+	}
+	// Notificar cambio a todos
+	go h.hub.Publicar(ctx, inc.EventoID, models.EventoWS{
+		Tipo:     models.WSIncidenciaActualizada,
+		Payload:  inc,
+		EventoID: inc.EventoID,
+	})
+	c.JSON(http.StatusOK, inc)
+}
+
+// ─── Tarea ────────────────────────────────────────────────────────────────────
+
+type TareaHandler struct {
+	repo       *repository.TareaRepo
+	eventoRepo *repository.EventoRepo
+	hub        *ws.Hub
+}
+
+func NewTareaHandler(r *repository.TareaRepo, e *repository.EventoRepo, h *ws.Hub) *TareaHandler {
+	return &TareaHandler{repo: r, eventoRepo: e, hub: h}
+}
+
+// GET /api/v1/tareas
+func (h *TareaHandler) Listar(c *gin.Context) {
+	eventoID := middleware.GetEventoID(c)
+	if eventoID == "" {
+		if ev, _ := h.eventoRepo.ObtenerActivo(c.Request.Context()); ev != nil {
+			eventoID = ev.ID
+		}
+	}
+	lista, err := h.repo.Listar(c.Request.Context(), eventoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error listando tareas"})
+		return
+	}
+	c.JSON(http.StatusOK, lista)
+}
+
+// GET /api/v1/tareas/:id
+func (h *TareaHandler) ObtenerPorID(c *gin.Context) {
+	t, err := h.repo.ObtenerPorID(c.Request.Context(), c.Param("id"))
+	if err != nil || t == nil {
+		c.JSON(http.StatusNotFound, models.ErrorResponse{Error: "Tarea no encontrada"})
+		return
+	}
+	c.JSON(http.StatusOK, t)
+}
+
+// POST /api/v1/tareas  [solo admin]
+func (h *TareaHandler) Crear(c *gin.Context) {
+	var req models.CrearTareaRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	evento, err := h.eventoRepo.ObtenerActivo(ctx)
+	if err != nil || evento == nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "No hay evento activo"})
+		return
+	}
+	tarea, err := h.repo.Crear(ctx, &req, evento.ID, middleware.GetUsuarioID(c))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error creando tarea"})
+		return
+	}
+	go h.hub.Publicar(ctx, evento.ID, models.EventoWS{
+		Tipo:     models.WSTareaNueva,
+		Payload:  tarea,
+		EventoID: evento.ID,
+	})
+	c.JSON(http.StatusCreated, tarea)
+}
+
+// PATCH /api/v1/tareas/:id  (trabajador marca completada | admin reasigna)
+func (h *TareaHandler) Editar(c *gin.Context) {
+	var req models.EditarTareaRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	tarea, err := h.repo.Editar(ctx, c.Param("id"), &req)
+	if err != nil || tarea == nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "Error editando tarea"})
+		return
+	}
+	go h.hub.Publicar(ctx, tarea.EventoID, models.EventoWS{
+		Tipo:     models.WSTareaActualizada,
+		Payload:  tarea,
+		EventoID: tarea.EventoID,
+	})
 	c.JSON(http.StatusOK, tarea)
 }
 
-// ─── Chat Handler ─────────────────────────────────────────────────────────────
+// ─── Chat ─────────────────────────────────────────────────────────────────────
 
 type ChatHandler struct {
-	repo        *repository.MensajeRepository
-	usuarioRepo *repository.UsuarioRepository
+	mensajeRepo *repository.MensajeRepo
+	eventoRepo  *repository.EventoRepo
 	hub         *ws.Hub
 }
 
-func NewChatHandler(r *repository.MensajeRepository, ur *repository.UsuarioRepository, h *ws.Hub) *ChatHandler {
-	return &ChatHandler{repo: r, usuarioRepo: ur, hub: h}
+func NewChatHandler(m *repository.MensajeRepo, e *repository.EventoRepo, h *ws.Hub) *ChatHandler {
+	return &ChatHandler{mensajeRepo: m, eventoRepo: e, hub: h}
 }
 
+// GET /api/v1/chat/historial
 func (h *ChatHandler) Historial(c *gin.Context) {
 	eventoID := middleware.GetEventoID(c)
-	mensajes, err := h.repo.Listar(c.Request.Context(), eventoID, 50)
+	if eventoID == "" {
+		if ev, _ := h.eventoRepo.ObtenerActivo(c.Request.Context()); ev != nil {
+			eventoID = ev.ID
+		}
+	}
+	msgs, err := h.mensajeRepo.Listar(c.Request.Context(), eventoID, 50)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error obteniendo historial"})
 		return
 	}
-	c.JSON(http.StatusOK, mensajes)
+	c.JSON(http.StatusOK, msgs)
 }
 
+// POST /api/v1/chat/mensaje  (admin y trabajadores)
 func (h *ChatHandler) Enviar(c *gin.Context) {
 	var req models.EnviarMensajeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
 		return
 	}
-
+	ctx := c.Request.Context()
 	usuarioID := middleware.GetUsuarioID(c)
 	eventoID := middleware.GetEventoID(c)
-	ctx := c.Request.Context()
 
-	// El repo ya trae nombre + rol en el mismo query (WITH inserted + JOIN)
-	msg, err := h.repo.Crear(ctx, &models.Mensaje{
-		EventoID:  eventoID,
-		UsuarioID: usuarioID,
-		Contenido: req.Contenido,
-	})
+	// Admin puede enviar aunque no tenga evento_id en token, usar el activo
+	if eventoID == "" {
+		if ev, _ := h.eventoRepo.ObtenerActivo(ctx); ev != nil {
+			eventoID = ev.ID
+		}
+	}
+	if eventoID == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "No hay evento activo"})
+		return
+	}
+
+	msg, err := h.mensajeRepo.Crear(ctx, eventoID, usuarioID, req.Contenido)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error enviando mensaje"})
 		return
 	}
 
-	go h.hub.PublicarEvento(ctx, eventoID, models.EventoWS{
+	// Distribuir a todos por WS — aquí es donde todos ven nombre + rol
+	go h.hub.Publicar(ctx, eventoID, models.EventoWS{
 		Tipo:     models.WSMensajeNuevo,
 		Payload:  msg,
 		EventoID: eventoID,
@@ -282,31 +497,45 @@ func (h *ChatHandler) Enviar(c *gin.Context) {
 	c.JSON(http.StatusCreated, msg)
 }
 
-// ─── WebSocket Handler ────────────────────────────────────────────────────────
+// ─── WebSocket ────────────────────────────────────────────────────────────────
 
 type WSHandler struct {
-	hub    *ws.Hub
-	jwtSvc *auth.JWTService
+	hub        *ws.Hub
+	jwtSvc     *auth.JWTService
+	eventoRepo *repository.EventoRepo
 }
 
-func NewWSHandler(h *ws.Hub, j *auth.JWTService) *WSHandler {
-	return &WSHandler{hub: h, jwtSvc: j}
+func NewWSHandler(h *ws.Hub, j *auth.JWTService, e *repository.EventoRepo) *WSHandler {
+	return &WSHandler{hub: h, jwtSvc: j, eventoRepo: e}
 }
 
-// Conectar maneja el upgrade HTTP→WebSocket.
-// El token se pasa como query param porque WS no soporta headers custom en algunos clientes.
+// GET /ws?token=JWT
+// Admin se conecta usando el evento_id activo aunque su token no lo tenga
 func (h *WSHandler) Conectar(c *gin.Context) {
 	tokenStr := c.Query("token")
 	if tokenStr == "" {
-		c.JSON(http.StatusUnauthorized, models.ErrorResponse{Error: "Token requerido"})
+		c.JSON(http.StatusUnauthorized, models.ErrorResponse{Error: "Token requerido como query param: ?token=..."})
 		return
 	}
-
 	claims, err := h.jwtSvc.ValidarToken(tokenStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.ErrorResponse{Error: "Token inválido"})
 		return
 	}
 
-	h.hub.HandleConexion(c.Writer, c.Request, claims.UsuarioID, claims.EventoID)
+	eventoID := claims.EventoID
+
+	// Si es admin y no tiene evento en el token, usar el evento activo
+	if (eventoID == nil || *eventoID == "") && claims.Rol == models.RolAdmin {
+		if ev, _ := h.eventoRepo.ObtenerActivo(c.Request.Context()); ev != nil {
+			eventoID = &ev.ID
+		}
+	}
+
+	if eventoID == nil || *eventoID == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "No hay evento activo al que conectarse"})
+		return
+	}
+
+	h.hub.HandleConexion(c.Writer, c.Request, claims.UsuarioID, *eventoID)
 }

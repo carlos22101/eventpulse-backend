@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/eventpulse/backend/internal/models"
@@ -12,32 +11,28 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// ─── Usuario Repository ───────────────────────────────────────────────────────
+// ─── Usuario ──────────────────────────────────────────────────────────────────
 
-type UsuarioRepository struct {
-	db *sqlx.DB
-}
+type UsuarioRepo struct{ db *sqlx.DB }
 
-func NewUsuarioRepository(db *sqlx.DB) *UsuarioRepository {
-	return &UsuarioRepository{db: db}
-}
+func NewUsuarioRepo(db *sqlx.DB) *UsuarioRepo { return &UsuarioRepo{db: db} }
 
-func (r *UsuarioRepository) BuscarPorEmail(ctx context.Context, email string) (*models.Usuario, error) {
+func (r *UsuarioRepo) BuscarPorNombreUsuario(ctx context.Context, nombreUsuario string) (*models.Usuario, error) {
 	var u models.Usuario
 	err := r.db.GetContext(ctx, &u, `
-		SELECT id, evento_id, zona_id, nombre, email, password_hash, rol, activo, creado_en
-		FROM usuarios WHERE email = $1 AND activo = true
-	`, email)
+		SELECT id, nombre_usuario, nombre, password_hash, rol, evento_id, activo, creado_en
+		FROM usuarios WHERE nombre_usuario = $1 AND activo = true
+	`, nombreUsuario)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	return &u, err
 }
 
-func (r *UsuarioRepository) BuscarPorID(ctx context.Context, id string) (*models.Usuario, error) {
+func (r *UsuarioRepo) BuscarPorID(ctx context.Context, id string) (*models.Usuario, error) {
 	var u models.Usuario
 	err := r.db.GetContext(ctx, &u, `
-		SELECT id, evento_id, zona_id, nombre, email, password_hash, rol, activo, creado_en
+		SELECT id, nombre_usuario, nombre, password_hash, rol, evento_id, activo, creado_en
 		FROM usuarios WHERE id = $1
 	`, id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -46,199 +41,309 @@ func (r *UsuarioRepository) BuscarPorID(ctx context.Context, id string) (*models
 	return &u, err
 }
 
-func (r *UsuarioRepository) ValidarPassword(hash, password string) bool {
+func (r *UsuarioRepo) Crear(ctx context.Context, req *models.CrearUsuarioRequest, eventoID string) (*models.Usuario, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, err
+	}
+	var u models.Usuario
+	err = r.db.GetContext(ctx, &u, `
+		INSERT INTO usuarios (nombre_usuario, nombre, password_hash, rol, evento_id)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, nombre_usuario, nombre, rol, evento_id, activo, creado_en
+	`, req.NombreUsuario, req.Nombre, string(hash), req.Rol, eventoID)
+	return &u, err
+}
+
+func (r *UsuarioRepo) Listar(ctx context.Context, eventoID string) ([]models.Usuario, error) {
+	var lista []models.Usuario
+	err := r.db.SelectContext(ctx, &lista, `
+		SELECT id, nombre_usuario, nombre, rol, evento_id, activo, creado_en
+		FROM usuarios
+		WHERE evento_id = $1 AND activo = true
+		ORDER BY rol, nombre
+	`, eventoID)
+	return lista, err
+}
+
+func (r *UsuarioRepo) ValidarPassword(hash, password string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
-// ─── Incidencia Repository ────────────────────────────────────────────────────
+// ─── Evento ───────────────────────────────────────────────────────────────────
 
-type IncidenciaRepository struct {
-	db *sqlx.DB
+type EventoRepo struct{ db *sqlx.DB }
+
+func NewEventoRepo(db *sqlx.DB) *EventoRepo { return &EventoRepo{db: db} }
+
+func (r *EventoRepo) Crear(ctx context.Context, req *models.CrearEventoRequest, adminID string) (*models.Evento, error) {
+	var e models.Evento
+	err := r.db.GetContext(ctx, &e, `
+		INSERT INTO eventos (nombre, descripcion, creado_por)
+		VALUES ($1, $2, $3)
+		RETURNING id, nombre, descripcion, estado, creado_por, creado_en, terminado_en
+	`, req.Nombre, req.Descripcion, adminID)
+	return &e, err
 }
 
-func NewIncidenciaRepository(db *sqlx.DB) *IncidenciaRepository {
-	return &IncidenciaRepository{db: db}
+func (r *EventoRepo) ObtenerActivo(ctx context.Context) (*models.Evento, error) {
+	var e models.Evento
+	err := r.db.GetContext(ctx, &e, `
+		SELECT id, nombre, descripcion, estado, creado_por, creado_en, terminado_en
+		FROM eventos WHERE estado = 'activo'
+		ORDER BY creado_en DESC LIMIT 1
+	`)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return &e, err
 }
 
-func (r *IncidenciaRepository) Listar(ctx context.Context, eventoID string) ([]models.Incidencia, error) {
-	var items []models.Incidencia
-	err := r.db.SelectContext(ctx, &items, `
+func (r *EventoRepo) Listar(ctx context.Context) ([]models.Evento, error) {
+	var lista []models.Evento
+	err := r.db.SelectContext(ctx, &lista, `
+		SELECT id, nombre, descripcion, estado, creado_por, creado_en, terminado_en
+		FROM eventos ORDER BY creado_en DESC
+	`)
+	return lista, err
+}
+
+func (r *EventoRepo) Terminar(ctx context.Context, eventoID string) (*models.Evento, error) {
+	ahora := time.Now()
+	var e models.Evento
+	err := r.db.GetContext(ctx, &e, `
+		UPDATE eventos SET estado = 'terminado', terminado_en = $1
+		WHERE id = $2 AND estado = 'activo'
+		RETURNING id, nombre, descripcion, estado, creado_por, creado_en, terminado_en
+	`, ahora, eventoID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("evento no encontrado o ya terminado")
+	}
+	return &e, err
+}
+
+// ─── Zona ─────────────────────────────────────────────────────────────────────
+
+type ZonaRepo struct{ db *sqlx.DB }
+
+func NewZonaRepo(db *sqlx.DB) *ZonaRepo { return &ZonaRepo{db: db} }
+
+func (r *ZonaRepo) Crear(ctx context.Context, req *models.CrearZonaRequest, eventoID string) (*models.Zona, error) {
+	var z models.Zona
+	err := r.db.GetContext(ctx, &z, `
+		INSERT INTO zonas (id, evento_id, nombre) VALUES ($1, $2, $3)
+		RETURNING id, evento_id, nombre
+	`, req.ID, eventoID, req.Nombre)
+	return &z, err
+}
+
+func (r *ZonaRepo) Listar(ctx context.Context, eventoID string) ([]models.Zona, error) {
+	var lista []models.Zona
+	err := r.db.SelectContext(ctx, &lista, `
+		SELECT id, evento_id, nombre FROM zonas WHERE evento_id = $1 ORDER BY nombre
+	`, eventoID)
+	return lista, err
+}
+
+func (r *ZonaRepo) Eliminar(ctx context.Context, zonaID, eventoID string) error {
+	res, err := r.db.ExecContext(ctx, `
+		DELETE FROM zonas WHERE id = $1 AND evento_id = $2
+	`, zonaID, eventoID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return errors.New("zona no encontrada")
+	}
+	return nil
+}
+
+// ─── Incidencia ───────────────────────────────────────────────────────────────
+
+type IncidenciaRepo struct{ db *sqlx.DB }
+
+func NewIncidenciaRepo(db *sqlx.DB) *IncidenciaRepo { return &IncidenciaRepo{db: db} }
+
+func (r *IncidenciaRepo) Crear(ctx context.Context, req *models.CrearIncidenciaRequest, eventoID, adminID string) (*models.Incidencia, error) {
+	var inc models.Incidencia
+	err := r.db.GetContext(ctx, &inc, `
+		WITH inserted AS (
+			INSERT INTO incidencias (evento_id, zona_id, tipo, descripcion, creada_por, asignada_a)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			RETURNING *
+		)
 		SELECT i.id, i.evento_id, i.zona_id, z.nombre as zona_nombre,
-		       i.tipo, i.descripcion, i.estado, i.reportada_por,
-		       i.atendida_por, i.creada_en, i.actualizada_en
+		       i.tipo, i.descripcion, i.estado, i.creada_por, i.asignada_a,
+		       u.nombre as nombre_asignado,
+		       i.creada_en, i.actualizada_en
+		FROM inserted i
+		LEFT JOIN zonas z ON z.id = i.zona_id AND z.evento_id = i.evento_id
+		LEFT JOIN usuarios u ON u.id = i.asignada_a
+	`, eventoID, req.ZonaID, req.Tipo, req.Descripcion, adminID, req.AsignadaA)
+	return &inc, err
+}
+
+func (r *IncidenciaRepo) Listar(ctx context.Context, eventoID string) ([]models.Incidencia, error) {
+	var lista []models.Incidencia
+	err := r.db.SelectContext(ctx, &lista, `
+		SELECT i.id, i.evento_id, i.zona_id, z.nombre as zona_nombre,
+		       i.tipo, i.descripcion, i.estado, i.creada_por, i.asignada_a,
+		       u.nombre as nombre_asignado,
+		       i.creada_en, i.actualizada_en
 		FROM incidencias i
-		JOIN zonas z ON z.id = i.zona_id
+		LEFT JOIN zonas z ON z.id = i.zona_id AND z.evento_id = i.evento_id
+		LEFT JOIN usuarios u ON u.id = i.asignada_a
 		WHERE i.evento_id = $1
 		ORDER BY i.creada_en DESC
 	`, eventoID)
-	return items, err
+	return lista, err
 }
 
-func (r *IncidenciaRepository) Crear(ctx context.Context, inc *models.Incidencia) (*models.Incidencia, error) {
-	var creada models.Incidencia
-	err := r.db.GetContext(ctx, &creada, `
-		INSERT INTO incidencias (evento_id, zona_id, tipo, descripcion, estado, reportada_por)
-		VALUES ($1, $2, $3, $4, 'pendiente', $5)
-		RETURNING id, evento_id, zona_id, tipo, descripcion, estado,
-		          reportada_por, atendida_por, creada_en, actualizada_en
-	`, inc.EventoID, inc.ZonaID, inc.Tipo, inc.Descripcion, inc.ReportadaPor)
-	return &creada, err
-}
-
-// AtenderConLock usa SELECT FOR UPDATE SKIP LOCKED para manejar concurrencia.
-// Si otro usuario ya tomó la incidencia, retorna un error descriptivo en lugar de bloquear.
-func (r *IncidenciaRepository) AtenderConLock(ctx context.Context, incID, usuarioID string) (*models.Incidencia, error) {
-	tx, err := r.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	// Intentar tomar el lock de la fila
+func (r *IncidenciaRepo) ObtenerPorID(ctx context.Context, id string) (*models.Incidencia, error) {
 	var inc models.Incidencia
-	err = tx.GetContext(ctx, &inc, `
-		SELECT id, estado, atendida_por
-		FROM incidencias
-		WHERE id = $1
-		FOR UPDATE SKIP LOCKED
-	`, incID)
-
+	err := r.db.GetContext(ctx, &inc, `
+		SELECT i.id, i.evento_id, i.zona_id, z.nombre as zona_nombre,
+		       i.tipo, i.descripcion, i.estado, i.creada_por, i.asignada_a,
+		       u.nombre as nombre_asignado,
+		       i.creada_en, i.actualizada_en
+		FROM incidencias i
+		LEFT JOIN zonas z ON z.id = i.zona_id AND z.evento_id = i.evento_id
+		LEFT JOIN usuarios u ON u.id = i.asignada_a
+		WHERE i.id = $1
+	`, id)
 	if errors.Is(err, sql.ErrNoRows) {
-		// SKIP LOCKED retornó vacío: otro usuario ya tiene el lock
-		// Consultamos sin lock para saber quién la tiene
-		var actual models.Incidencia
-		if dbErr := r.db.GetContext(ctx, &actual, `
-			SELECT i.id, i.estado, i.atendida_por, u.nombre as zona_nombre
-			FROM incidencias i
-			LEFT JOIN usuarios u ON u.id = i.atendida_por
-			WHERE i.id = $1
-		`, incID); dbErr != nil {
-			return nil, fmt.Errorf("incidencia_conflicto:desconocido")
-		}
-		nombre := "otro usuario"
-		if actual.AtendidaPor != nil {
-			nombre = actual.ZonaNombre // reutilizamos el campo como nombre del usuario
-		}
-		return nil, fmt.Errorf("incidencia_conflicto:%s", nombre)
+		return nil, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-
-	if inc.Estado != models.EstadoPendiente {
-		return nil, fmt.Errorf("incidencia_conflicto:ya está en estado %s", inc.Estado)
-	}
-
-	// Actualizar estado
-	var actualizada models.Incidencia
-	err = tx.GetContext(ctx, &actualizada, `
-		UPDATE incidencias
-		SET estado = 'en_atencion', atendida_por = $1
-		WHERE id = $2
-		RETURNING id, evento_id, zona_id, tipo, descripcion, estado,
-		          reportada_por, atendida_por, creada_en, actualizada_en
-	`, usuarioID, incID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Registrar en historial
-	tx.ExecContext(ctx, `
-		INSERT INTO incidencias_historial (incidencia_id, estado_anterior, estado_nuevo, usuario_id)
-		VALUES ($1, 'pendiente', 'en_atencion', $2)
-	`, incID, usuarioID)
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-
-	return &actualizada, nil
+	return &inc, err
 }
 
-func (r *IncidenciaRepository) Resolver(ctx context.Context, incID, usuarioID string) (*models.Incidencia, error) {
+// Editar permite al trabajador cambiar estado, o al admin cambiar cualquier campo
+func (r *IncidenciaRepo) Editar(ctx context.Context, id string, req *models.EditarIncidenciaRequest, usuarioID string) (*models.Incidencia, error) {
 	tx, err := r.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 
-	var actualizada models.Incidencia
-	err = tx.GetContext(ctx, &actualizada, `
-		UPDATE incidencias
-		SET estado = 'resuelta', atendida_por = $1
-		WHERE id = $2 AND (atendida_por = $1 OR $3 = 'supervisor' OR $3 = 'admin')
-		RETURNING id, evento_id, zona_id, tipo, descripcion, estado,
-		          reportada_por, atendida_por, creada_en, actualizada_en
-	`, usuarioID, incID, usuarioID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, errors.New("no tienes permiso para resolver esta incidencia")
-	}
-	if err != nil {
-		return nil, err
-	}
+	// Leer estado actual para historial
+	var estadoActual string
+	tx.QueryRowContext(ctx, `SELECT estado FROM incidencias WHERE id = $1`, id).Scan(&estadoActual)
 
-	tx.ExecContext(ctx, `
-		INSERT INTO incidencias_historial (incidencia_id, estado_anterior, estado_nuevo, usuario_id)
-		VALUES ($1, 'en_atencion', 'resuelta', $2)
-	`, incID, usuarioID)
+	// Construir update dinámico
+	if req.Estado != nil {
+		_, err = tx.ExecContext(ctx, `UPDATE incidencias SET estado = $1 WHERE id = $2`, *req.Estado, id)
+		if err != nil {
+			return nil, err
+		}
+		// Historial
+		tx.ExecContext(ctx, `
+			INSERT INTO incidencias_historial (incidencia_id, estado_anterior, estado_nuevo, usuario_id)
+			VALUES ($1, $2, $3, $4)
+		`, id, estadoActual, *req.Estado, usuarioID)
+	}
+	if req.AsignadaA != nil {
+		_, err = tx.ExecContext(ctx, `UPDATE incidencias SET asignada_a = $1 WHERE id = $2`, *req.AsignadaA, id)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	tx.Commit()
-	return &actualizada, nil
+
+	return r.ObtenerPorID(ctx, id)
 }
 
-// ─── Tarea Repository ─────────────────────────────────────────────────────────
+// ─── Tarea ────────────────────────────────────────────────────────────────────
 
-type TareaRepository struct {
-	db *sqlx.DB
-}
+type TareaRepo struct{ db *sqlx.DB }
 
-func NewTareaRepository(db *sqlx.DB) *TareaRepository {
-	return &TareaRepository{db: db}
-}
+func NewTareaRepo(db *sqlx.DB) *TareaRepo { return &TareaRepo{db: db} }
 
-func (r *TareaRepository) Listar(ctx context.Context, eventoID string) ([]models.Tarea, error) {
-	var tareas []models.Tarea
-	err := r.db.SelectContext(ctx, &tareas, `
-		SELECT id, evento_id, zona_id, titulo, descripcion, estado,
-		       prioridad, asignada_a, completada_en, creada_en
-		FROM tareas
-		WHERE evento_id = $1
-		ORDER BY
-			CASE prioridad WHEN 'alta' THEN 1 WHEN 'media' THEN 2 ELSE 3 END,
-			creada_en DESC
-	`, eventoID)
-	return tareas, err
-}
-
-func (r *TareaRepository) Completar(ctx context.Context, tareaID, usuarioID string) (*models.Tarea, error) {
-	ahora := time.Now()
-	var tarea models.Tarea
-	err := r.db.GetContext(ctx, &tarea, `
-		UPDATE tareas
-		SET estado = 'completada', asignada_a = $1, completada_en = $2
-		WHERE id = $3 AND estado = 'pendiente'
-		RETURNING id, evento_id, zona_id, titulo, descripcion, estado,
-		          prioridad, asignada_a, completada_en, creada_en
-	`, usuarioID, ahora, tareaID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, errors.New("tarea no encontrada o ya completada")
+func (r *TareaRepo) Crear(ctx context.Context, req *models.CrearTareaRequest, eventoID, adminID string) (*models.Tarea, error) {
+	var zonaID *string
+	if req.ZonaID != "" {
+		zonaID = &req.ZonaID
 	}
-	return &tarea, err
+	var t models.Tarea
+	err := r.db.GetContext(ctx, &t, `
+		WITH inserted AS (
+			INSERT INTO tareas (evento_id, zona_id, titulo, descripcion, prioridad, creada_por, asignada_a)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			RETURNING *
+		)
+		SELECT t.id, t.evento_id, t.zona_id, z.nombre as zona_nombre,
+		       t.titulo, t.descripcion, t.estado, t.prioridad,
+		       t.creada_por, t.asignada_a, u.nombre as nombre_asignado,
+		       t.completada_en, t.creada_en
+		FROM inserted t
+		LEFT JOIN zonas z ON z.id = t.zona_id AND z.evento_id = t.evento_id
+		LEFT JOIN usuarios u ON u.id = t.asignada_a
+	`, eventoID, zonaID, req.Titulo, req.Descripcion, req.Prioridad, adminID, req.AsignadaA)
+	return &t, err
 }
 
-// ─── Mensaje Repository ───────────────────────────────────────────────────────
-
-type MensajeRepository struct {
-	db *sqlx.DB
+func (r *TareaRepo) Listar(ctx context.Context, eventoID string) ([]models.Tarea, error) {
+	var lista []models.Tarea
+	err := r.db.SelectContext(ctx, &lista, `
+		SELECT t.id, t.evento_id, t.zona_id, z.nombre as zona_nombre,
+		       t.titulo, t.descripcion, t.estado, t.prioridad,
+		       t.creada_por, t.asignada_a, u.nombre as nombre_asignado,
+		       t.completada_en, t.creada_en
+		FROM tareas t
+		LEFT JOIN zonas z ON z.id = t.zona_id AND z.evento_id = t.evento_id
+		LEFT JOIN usuarios u ON u.id = t.asignada_a
+		WHERE t.evento_id = $1
+		ORDER BY
+			CASE t.prioridad WHEN 'alta' THEN 1 WHEN 'media' THEN 2 ELSE 3 END,
+			t.creada_en DESC
+	`, eventoID)
+	return lista, err
 }
 
-func NewMensajeRepository(db *sqlx.DB) *MensajeRepository {
-	return &MensajeRepository{db: db}
+func (r *TareaRepo) ObtenerPorID(ctx context.Context, id string) (*models.Tarea, error) {
+	var t models.Tarea
+	err := r.db.GetContext(ctx, &t, `
+		SELECT t.id, t.evento_id, t.zona_id, z.nombre as zona_nombre,
+		       t.titulo, t.descripcion, t.estado, t.prioridad,
+		       t.creada_por, t.asignada_a, u.nombre as nombre_asignado,
+		       t.completada_en, t.creada_en
+		FROM tareas t
+		LEFT JOIN zonas z ON z.id = t.zona_id AND z.evento_id = t.evento_id
+		LEFT JOIN usuarios u ON u.id = t.asignada_a
+		WHERE t.id = $1
+	`, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return &t, err
 }
 
-func (r *MensajeRepository) Listar(ctx context.Context, eventoID string, limite int) ([]models.Mensaje, error) {
-	var mensajes []models.Mensaje
-	err := r.db.SelectContext(ctx, &mensajes, `
+func (r *TareaRepo) Editar(ctx context.Context, id string, req *models.EditarTareaRequest) (*models.Tarea, error) {
+	if req.Estado != nil {
+		_, err := r.db.ExecContext(ctx, `UPDATE tareas SET estado = $1 WHERE id = $2`, *req.Estado, id)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if req.AsignadaA != nil {
+		_, err := r.db.ExecContext(ctx, `UPDATE tareas SET asignada_a = $1 WHERE id = $2`, *req.AsignadaA, id)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return r.ObtenerPorID(ctx, id)
+}
+
+// ─── Mensaje ──────────────────────────────────────────────────────────────────
+
+type MensajeRepo struct{ db *sqlx.DB }
+
+func NewMensajeRepo(db *sqlx.DB) *MensajeRepo { return &MensajeRepo{db: db} }
+
+func (r *MensajeRepo) Listar(ctx context.Context, eventoID string, limite int) ([]models.Mensaje, error) {
+	var lista []models.Mensaje
+	err := r.db.SelectContext(ctx, &lista, `
 		SELECT m.id, m.evento_id, m.usuario_id,
 		       u.nombre    AS nombre_usuario,
 		       u.rol       AS rol_usuario,
@@ -249,17 +354,16 @@ func (r *MensajeRepository) Listar(ctx context.Context, eventoID string, limite 
 		ORDER BY m.enviado_en DESC
 		LIMIT $2
 	`, eventoID, limite)
-	// Revertir para orden cronológico
-	for i, j := 0, len(mensajes)-1; i < j; i, j = i+1, j-1 {
-		mensajes[i], mensajes[j] = mensajes[j], mensajes[i]
+	// Invertir a orden cronológico
+	for i, j := 0, len(lista)-1; i < j; i, j = i+1, j-1 {
+		lista[i], lista[j] = lista[j], lista[i]
 	}
-	return mensajes, err
+	return lista, err
 }
 
-func (r *MensajeRepository) Crear(ctx context.Context, msg *models.Mensaje) (*models.Mensaje, error) {
-	// Insertar y luego traer el nombre + rol en un solo query
-	var creado models.Mensaje
-	err := r.db.GetContext(ctx, &creado, `
+func (r *MensajeRepo) Crear(ctx context.Context, eventoID, usuarioID, contenido string) (*models.Mensaje, error) {
+	var msg models.Mensaje
+	err := r.db.GetContext(ctx, &msg, `
 		WITH inserted AS (
 			INSERT INTO mensajes (evento_id, usuario_id, contenido)
 			VALUES ($1, $2, $3)
@@ -271,6 +375,6 @@ func (r *MensajeRepository) Crear(ctx context.Context, msg *models.Mensaje) (*mo
 		       i.contenido, i.enviado_en
 		FROM inserted i
 		JOIN usuarios u ON u.id = i.usuario_id
-	`, msg.EventoID, msg.UsuarioID, msg.Contenido)
-	return &creado, err
+	`, eventoID, usuarioID, contenido)
+	return &msg, err
 }

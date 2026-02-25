@@ -1,104 +1,103 @@
 -- ============================================================
--- EventPulse - Schema PostgreSQL
--- Ejecutar en orden: psql -U eventpulse -d eventpulse_db -f 001_init.sql
+-- EventPulse v2 - Schema PostgreSQL
 -- ============================================================
 
--- Extensión para UUIDs
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ─── Admin único (creado directo, no por ruta) ────────────────────────────────
+-- El admin existe desde el inicio y no pertenece a un evento específico.
+-- Los trabajadores sí se vinculan al evento activo cuando el admin los crea.
+
+CREATE TABLE IF NOT EXISTS usuarios (
+    id             UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    nombre_usuario VARCHAR(50) UNIQUE NOT NULL,   -- username para login
+    nombre         VARCHAR(255) NOT NULL,          -- nombre visible en chat
+    password_hash  TEXT NOT NULL,
+    rol            VARCHAR(20) NOT NULL DEFAULT 'aseo'
+                   CHECK (rol IN ('admin','aseo','guardia','medico','logistica','supervisor')),
+    evento_id      UUID,                           -- NULL si es admin o no vinculado
+    activo         BOOLEAN DEFAULT true,
+    creado_en      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_usuarios_nombre_usuario ON usuarios(nombre_usuario);
 
 -- ─── Eventos ──────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS eventos (
     id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     nombre       VARCHAR(255) NOT NULL,
     descripcion  TEXT,
-    fecha_inicio TIMESTAMPTZ NOT NULL,
-    fecha_fin    TIMESTAMPTZ NOT NULL,
-    activo       BOOLEAN DEFAULT true,
-    creado_en    TIMESTAMPTZ DEFAULT NOW()
+    estado       VARCHAR(20) NOT NULL DEFAULT 'activo'
+                 CHECK (estado IN ('activo','terminado')),
+    creado_por   UUID NOT NULL REFERENCES usuarios(id),
+    creado_en    TIMESTAMPTZ DEFAULT NOW(),
+    terminado_en TIMESTAMPTZ
 );
+
+-- FK de usuarios → eventos (se agrega después para evitar referencia circular)
+ALTER TABLE usuarios ADD CONSTRAINT fk_usuarios_evento
+    FOREIGN KEY (evento_id) REFERENCES eventos(id) ON DELETE SET NULL;
 
 -- ─── Zonas ────────────────────────────────────────────────────────────────────
+-- ID manual definido por el admin ej: "bano-norte", "pasillo-4", "entrada"
 CREATE TABLE IF NOT EXISTS zonas (
-    id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id        VARCHAR(50) NOT NULL,              -- ID legible, manual
     evento_id UUID NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
     nombre    VARCHAR(100) NOT NULL,
-    pos_x     DECIMAL(5,2) DEFAULT 0,   -- Posición % en el mapa (0-100)
-    pos_y     DECIMAL(5,2) DEFAULT 0,
-    color     VARCHAR(7) DEFAULT '#3B82F6'
+    PRIMARY KEY (id, evento_id)                  -- único por evento
 );
-
--- ─── Usuarios / Staff ─────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS usuarios (
-    id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    evento_id     UUID NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
-    zona_id       UUID REFERENCES zonas(id) ON DELETE SET NULL,
-    nombre        VARCHAR(255) NOT NULL,
-    email         VARCHAR(255) UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    rol           VARCHAR(20) NOT NULL DEFAULT 'aseo'
-                  CHECK (rol IN ('aseo', 'guardia', 'medico', 'logistica', 'supervisor', 'admin')),
-    activo        BOOLEAN DEFAULT true,
-    creado_en     TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_usuarios_email ON usuarios(email);
-CREATE INDEX IF NOT EXISTS idx_usuarios_evento ON usuarios(evento_id);
 
 -- ─── Incidencias ──────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS incidencias (
-    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    evento_id       UUID NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
-    zona_id         UUID NOT NULL REFERENCES zonas(id) ON DELETE CASCADE,
-    tipo            VARCHAR(30) NOT NULL
-                    CHECK (tipo IN ('derrame','seguridad','reabastecimiento','medico','otro')),
-    descripcion     TEXT NOT NULL,
-    estado          VARCHAR(20) NOT NULL DEFAULT 'pendiente'
-                    CHECK (estado IN ('pendiente','en_atencion','resuelta')),
-    reportada_por   UUID NOT NULL REFERENCES usuarios(id),
-    atendida_por    UUID REFERENCES usuarios(id),
-    creada_en       TIMESTAMPTZ DEFAULT NOW(),
-    actualizada_en  TIMESTAMPTZ DEFAULT NOW()
+    id             UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    evento_id      UUID NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
+    zona_id        VARCHAR(50) NOT NULL,
+    tipo           VARCHAR(30) NOT NULL
+                   CHECK (tipo IN ('derrame','seguridad','reabastecimiento','medico','otro')),
+    descripcion    TEXT NOT NULL,
+    estado         VARCHAR(20) NOT NULL DEFAULT 'pendiente'
+                   CHECK (estado IN ('pendiente','en_atencion','resuelta')),
+    creada_por     UUID NOT NULL REFERENCES usuarios(id),  -- siempre el admin
+    asignada_a     UUID REFERENCES usuarios(id),           -- trabajador asignado
+    creada_en      TIMESTAMPTZ DEFAULT NOW(),
+    actualizada_en TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_incidencias_evento ON incidencias(evento_id);
-CREATE INDEX IF NOT EXISTS idx_incidencias_estado ON incidencias(estado);
-CREATE INDEX IF NOT EXISTS idx_incidencias_zona ON incidencias(zona_id);
+CREATE INDEX IF NOT EXISTS idx_incidencias_evento  ON incidencias(evento_id);
+CREATE INDEX IF NOT EXISTS idx_incidencias_estado  ON incidencias(estado);
 
--- Trigger para actualizar actualizada_en automáticamente
+-- Trigger actualizada_en
 CREATE OR REPLACE FUNCTION update_actualizada_en()
 RETURNS TRIGGER AS $$
-BEGIN
-    NEW.actualizada_en = NOW();
-    RETURN NEW;
-END;
+BEGIN NEW.actualizada_en = NOW(); RETURN NEW; END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_incidencias_actualizada_en
+CREATE TRIGGER trg_incidencias_upd
     BEFORE UPDATE ON incidencias
     FOR EACH ROW EXECUTE FUNCTION update_actualizada_en();
 
--- Historial de incidencias (auditoría y rollback)
+-- Historial
 CREATE TABLE IF NOT EXISTS incidencias_historial (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     incidencia_id   UUID NOT NULL REFERENCES incidencias(id) ON DELETE CASCADE,
     estado_anterior VARCHAR(20),
     estado_nuevo    VARCHAR(20),
     usuario_id      UUID REFERENCES usuarios(id),
-    cambiado_en     TIMESTAMPTZ DEFAULT NOW(),
-    notas           TEXT
+    cambiado_en     TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- ─── Tareas ───────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS tareas (
     id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     evento_id     UUID NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
-    zona_id       UUID REFERENCES zonas(id) ON DELETE SET NULL,
+    zona_id       VARCHAR(50),
     titulo        VARCHAR(255) NOT NULL,
     descripcion   TEXT,
     estado        VARCHAR(20) NOT NULL DEFAULT 'pendiente'
-                  CHECK (estado IN ('pendiente','completada')),
+                  CHECK (estado IN ('pendiente','en_progreso','completada')),
     prioridad     VARCHAR(10) NOT NULL DEFAULT 'media'
                   CHECK (prioridad IN ('alta','media','baja')),
+    creada_por    UUID NOT NULL REFERENCES usuarios(id),
     asignada_a    UUID REFERENCES usuarios(id),
     completada_en TIMESTAMPTZ,
     creada_en     TIMESTAMPTZ DEFAULT NOW()
@@ -107,34 +106,33 @@ CREATE TABLE IF NOT EXISTS tareas (
 CREATE INDEX IF NOT EXISTS idx_tareas_evento ON tareas(evento_id);
 CREATE INDEX IF NOT EXISTS idx_tareas_estado ON tareas(estado);
 
--- ─── Chat / Mensajes ──────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION update_tareas_actualizada_en()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.estado = 'completada' AND OLD.estado != 'completada' THEN
+        NEW.completada_en = NOW();
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_tareas_completada
+    BEFORE UPDATE ON tareas
+    FOR EACH ROW EXECUTE FUNCTION update_tareas_actualizada_en();
+
+-- ─── Mensajes Chat ────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS mensajes (
-    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    evento_id   UUID NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
-    usuario_id  UUID NOT NULL REFERENCES usuarios(id),
-    contenido   TEXT NOT NULL CHECK (LENGTH(contenido) <= 500),
-    enviado_en  TIMESTAMPTZ DEFAULT NOW()
+    id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    evento_id  UUID NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
+    usuario_id UUID NOT NULL REFERENCES usuarios(id),
+    contenido  TEXT NOT NULL CHECK (LENGTH(contenido) <= 500),
+    enviado_en TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_mensajes_evento ON mensajes(evento_id);
+CREATE INDEX IF NOT EXISTS idx_mensajes_evento  ON mensajes(evento_id);
 CREATE INDEX IF NOT EXISTS idx_mensajes_enviado ON mensajes(enviado_en DESC);
 
--- ─── Datos de ejemplo para desarrollo ────────────────────────────────────────
-INSERT INTO eventos (id, nombre, descripcion, fecha_inicio, fecha_fin)
-VALUES (
-    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
-    'Festival de Música 2024',
-    'Festival anual en el estadio central',
-    NOW(),
-    NOW() + INTERVAL '3 days'
-) ON CONFLICT DO NOTHING;
 
-INSERT INTO zonas (evento_id, nombre, pos_x, pos_y, color) VALUES
-    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'Entrada Principal', 50, 5, '#3B82F6'),
-    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'Escenario Central', 50, 40, '#8B5CF6'),
-    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'Pasillo 1', 20, 50, '#10B981'),
-    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'Pasillo 2', 80, 50, '#10B981'),
-    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'Zona VIP', 50, 70, '#F59E0B'),
-    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'Baños Norte', 20, 90, '#6B7280'),
-    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'Baños Sur', 80, 90, '#6B7280')
-ON CONFLICT DO NOTHING;
+INSERT INTO usuarios (nombre_usuario, nombre, password_hash, rol, evento_id)
+VALUES ('admin', 'Administrador', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LPVKoYDhHS6', 'admin', NULL)
+ON CONFLICT (nombre_usuario) DO NOTHING;

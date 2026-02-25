@@ -14,13 +14,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ─── Upgrader ─────────────────────────────────────────────────────────────────
-
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	// En producción, validar el origen correctamente
-	CheckOrigin: func(r *http.Request) bool { return true },
+	ReadBufferSize:  2048,
+	WriteBufferSize: 2048,
+	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
 // ─── Cliente ──────────────────────────────────────────────────────────────────
@@ -33,40 +30,36 @@ type Cliente struct {
 	EventoID  string
 }
 
-func (c *Cliente) leerMensajes(maxMsgSize int64, pongWait time.Duration) {
+func (c *Cliente) leer(maxSize int64, pongWait time.Duration) {
 	defer func() {
 		c.hub.desregistrar <- c
 		c.conn.Close()
 	}()
-
-	c.conn.SetReadLimit(maxMsgSize)
+	c.conn.SetReadLimit(maxSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
-
 	for {
+		// El cliente solo recibe. No procesa mensajes entrantes por WS.
+		// Todo se envía por REST y se distribuye por WS.
 		_, _, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err,
-				websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WS error cliente %s: %v", c.UsuarioID, err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WS cliente %s cerró inesperadamente: %v", c.UsuarioID, err)
 			}
 			break
 		}
-		// El cliente no envía mensajes por WS (solo recibe).
-		// Las acciones se hacen por REST → servidor publica en Redis.
 	}
 }
 
-func (c *Cliente) escribirMensajes(pingPeriod time.Duration) {
+func (c *Cliente) escribir(pingPeriod time.Duration) {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
 		c.conn.Close()
 	}()
-
 	for {
 		select {
 		case msg, ok := <-c.send:
@@ -88,12 +81,9 @@ func (c *Cliente) escribirMensajes(pingPeriod time.Duration) {
 }
 
 // ─── Hub ──────────────────────────────────────────────────────────────────────
-// El Hub mantiene todas las conexiones activas y distribuye mensajes.
-// Redis Pub/Sub permite que múltiples instancias del servidor se comuniquen.
 
 type Hub struct {
-	// clientes agrupados por eventoID
-	clientes     map[string]map[*Cliente]bool
+	clientes     map[string]map[*Cliente]bool // eventoID → clientes
 	mu           sync.RWMutex
 	registrar    chan *Cliente
 	desregistrar chan *Cliente
@@ -101,41 +91,39 @@ type Hub struct {
 	cfg          *config.Config
 }
 
-func NewHub(redisClient *redis.Client, cfg *config.Config) *Hub {
+func NewHub(r *redis.Client, cfg *config.Config) *Hub {
 	return &Hub{
 		clientes:     make(map[string]map[*Cliente]bool),
 		registrar:    make(chan *Cliente, 64),
 		desregistrar: make(chan *Cliente, 64),
-		redis:        redisClient,
+		redis:        r,
 		cfg:          cfg,
 	}
 }
 
 func (h *Hub) Run(ctx context.Context) {
-	// Suscribirse al canal de Redis para recibir eventos de otras instancias
-	go h.suscribirRedis(ctx)
-
+	go h.escucharRedis(ctx)
 	for {
 		select {
-		case cliente := <-h.registrar:
+		case c := <-h.registrar:
 			h.mu.Lock()
-			if h.clientes[cliente.EventoID] == nil {
-				h.clientes[cliente.EventoID] = make(map[*Cliente]bool)
+			if h.clientes[c.EventoID] == nil {
+				h.clientes[c.EventoID] = make(map[*Cliente]bool)
 			}
-			h.clientes[cliente.EventoID][cliente] = true
+			h.clientes[c.EventoID][c] = true
 			h.mu.Unlock()
-			log.Printf("Cliente conectado: %s (evento: %s)", cliente.UsuarioID, cliente.EventoID)
+			log.Printf("✅ WS conectado: %s (evento: %s)", c.UsuarioID, c.EventoID)
 
-		case cliente := <-h.desregistrar:
+		case c := <-h.desregistrar:
 			h.mu.Lock()
-			if conns, ok := h.clientes[cliente.EventoID]; ok {
-				if _, ok := conns[cliente]; ok {
-					delete(conns, cliente)
-					close(cliente.send)
+			if conns, ok := h.clientes[c.EventoID]; ok {
+				if _, ok := conns[c]; ok {
+					delete(conns, c)
+					close(c.send)
 				}
 			}
 			h.mu.Unlock()
-			log.Printf("Cliente desconectado: %s", cliente.UsuarioID)
+			log.Printf("❌ WS desconectado: %s", c.UsuarioID)
 
 		case <-ctx.Done():
 			return
@@ -143,30 +131,17 @@ func (h *Hub) Run(ctx context.Context) {
 	}
 }
 
-// PublicarEvento publica un evento en Redis para que llegue a TODAS las instancias.
-func (h *Hub) PublicarEvento(ctx context.Context, eventoID string, evento models.EventoWS) error {
+// Publicar envía un evento a TODOS los conectados al evento (incluye admin y trabajadores)
+func (h *Hub) Publicar(ctx context.Context, eventoID string, evento models.EventoWS) error {
 	data, err := json.Marshal(evento)
 	if err != nil {
 		return err
 	}
-	canal := "eventpulse:" + eventoID
-	return h.redis.Publish(ctx, canal, data).Err()
+	return h.redis.Publish(ctx, "ep:evento:"+eventoID, data).Err()
 }
 
-// PublicarAUsuario envía un evento SOLO a un usuario específico (para rollbacks).
-func (h *Hub) PublicarAUsuario(ctx context.Context, eventoID, usuarioID string, evento models.EventoWS) error {
-	data, err := json.Marshal(evento)
-	if err != nil {
-		return err
-	}
-	canal := "eventpulse:usuario:" + usuarioID
-	return h.redis.Publish(ctx, canal, data).Err()
-}
-
-// suscribirRedis escucha canales de Redis y distribuye a los clientes locales.
-func (h *Hub) suscribirRedis(ctx context.Context) {
-	// Patron: suscribirse a todos los canales de eventpulse
-	pubsub := h.redis.PSubscribe(ctx, "eventpulse:*")
+func (h *Hub) escucharRedis(ctx context.Context) {
+	pubsub := h.redis.PSubscribe(ctx, "ep:evento:*")
 	defer pubsub.Close()
 
 	for {
@@ -175,63 +150,50 @@ func (h *Hub) suscribirRedis(ctx context.Context) {
 			if !ok {
 				return
 			}
-			h.distribuirMensaje(msg.Channel, []byte(msg.Payload))
-
+			// Extraer eventoID del canal "ep:evento:{eventoID}"
+			var evento models.EventoWS
+			if err := json.Unmarshal([]byte(msg.Payload), &evento); err != nil {
+				continue
+			}
+			h.distribuir(evento.EventoID, []byte(msg.Payload))
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (h *Hub) distribuirMensaje(canal string, data []byte) {
+func (h *Hub) distribuir(eventoID string, data []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-
-	// Canal de usuario específico: "eventpulse:usuario:{usuarioID}"
-	// Canal de evento: "eventpulse:{eventoID}"
-	var evento models.EventoWS
-	if err := json.Unmarshal(data, &evento); err != nil {
-		log.Printf("Error parseando evento WS: %v", err)
-		return
-	}
-
-	if evento.EventoID == "" {
-		return
-	}
-
-	for cliente := range h.clientes[evento.EventoID] {
+	for c := range h.clientes[eventoID] {
 		select {
-		case cliente.send <- data:
+		case c.send <- data:
 		default:
-			// Buffer lleno, cerrar conexión del cliente lento
-			close(cliente.send)
-			delete(h.clientes[evento.EventoID], cliente)
+			close(c.send)
+			delete(h.clientes[eventoID], c)
 		}
 	}
 }
 
-// ─── Handler de upgrade HTTP → WebSocket ─────────────────────────────────────
-
+// HandleConexion hace el upgrade HTTP→WS y registra el cliente
 func (h *Hub) HandleConexion(w http.ResponseWriter, r *http.Request, usuarioID, eventoID string) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Error upgrade WS: %v", err)
 		return
 	}
-
-	cliente := &Cliente{
+	c := &Cliente{
 		hub:       h,
 		conn:      conn,
-		send:      make(chan []byte, 256),
+		send:      make(chan []byte, 512),
 		UsuarioID: usuarioID,
 		EventoID:  eventoID,
 	}
-
-	h.registrar <- cliente
+	h.registrar <- c
 
 	pongWait := time.Duration(h.cfg.WS.PongWait) * time.Second
 	pingPeriod := (pongWait * 9) / 10
 
-	go cliente.escribirMensajes(pingPeriod)
-	go cliente.leerMensajes(h.cfg.WS.MaxMessageSize, pongWait)
+	go c.escribir(pingPeriod)
+	go c.leer(h.cfg.WS.MaxMessageSize, pongWait)
 }

@@ -10,9 +10,9 @@ import (
 )
 
 type Claims struct {
-	UsuarioID string      `json:"usuario_id"`
-	EventoID  string      `json:"evento_id"`
-	Rol       models.Rol  `json:"rol"`
+	UsuarioID string     `json:"usuario_id"`
+	EventoID  *string    `json:"evento_id"`
+	Rol       models.Rol `json:"rol"`
 	jwt.RegisteredClaims
 }
 
