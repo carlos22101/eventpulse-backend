@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"net/http"
 	"strings"
 
@@ -260,6 +261,7 @@ func (h *ZonaHandler) Eliminar(c *gin.Context) {
 }
 
 // ─── Incidencia ───────────────────────────────────────────────────────────────
+// ─── Incidencia ───────────────────────────────────────────────────────────────
 
 type IncidenciaHandler struct {
 	repo       *repository.IncidenciaRepo
@@ -304,48 +306,80 @@ func (h *IncidenciaHandler) Crear(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
 		return
 	}
+
 	ctx := c.Request.Context()
+
 	evento, err := h.eventoRepo.ObtenerActivo(ctx)
 	if err != nil || evento == nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "No hay evento activo"})
 		return
 	}
+
 	inc, err := h.repo.Crear(ctx, &req, evento.ID, middleware.GetUsuarioID(c))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error creando incidencia"})
 		return
 	}
-	// Notificar a todos por WS
-	go h.hub.Publicar(ctx, evento.ID, models.EventoWS{
-		Tipo:     models.WSIncidenciaNueva,
-		Payload:  inc,
-		EventoID: evento.ID,
-	})
+
+	// 🔥 PUBLICACIÓN SIN GOROUTINE + LOGS
+	if evento.ID == "" {
+		log.Println("❌ Crear incidencia: evento.ID vacío, no se publica WS")
+	} else {
+		log.Println("➡️ Publicando incidencia nueva en evento:", evento.ID)
+
+		err = h.hub.Publicar(ctx, evento.ID, models.EventoWS{
+			Tipo:     models.WSIncidenciaNueva,
+			Payload:  inc,
+			EventoID: evento.ID,
+		})
+
+		if err != nil {
+			log.Println("❌ Error publicando incidencia nueva en Redis:", err)
+		} else {
+			log.Println("✅ Publicado WS: incidencia nueva evento:", evento.ID)
+		}
+	}
+
 	c.JSON(http.StatusCreated, inc)
 }
 
-// PATCH /api/v1/incidencias/:id  (trabajador cambia estado | admin puede reasignar)
+// PATCH /api/v1/incidencias/:id
 func (h *IncidenciaHandler) Editar(c *gin.Context) {
 	var req models.EditarIncidenciaRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: err.Error()})
 		return
 	}
+
 	ctx := c.Request.Context()
+
 	inc, err := h.repo.Editar(ctx, c.Param("id"), &req, middleware.GetUsuarioID(c))
 	if err != nil || inc == nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "Error editando incidencia"})
 		return
 	}
-	// Notificar cambio a todos
-	go h.hub.Publicar(ctx, inc.EventoID, models.EventoWS{
-		Tipo:     models.WSIncidenciaActualizada,
-		Payload:  inc,
-		EventoID: inc.EventoID,
-	})
+
+	// 🔥 PUBLICACIÓN SIN GOROUTINE + LOGS
+	if inc.EventoID == "" {
+		log.Println("❌ Editar incidencia: inc.EventoID vacío, no se publica WS")
+	} else {
+		log.Println("➡️ Publicando incidencia actualizada en evento:", inc.EventoID)
+
+		err = h.hub.Publicar(ctx, inc.EventoID, models.EventoWS{
+			Tipo:     models.WSIncidenciaActualizada,
+			Payload:  inc,
+			EventoID: inc.EventoID,
+		})
+
+		if err != nil {
+			log.Println("❌ Error publicando incidencia actualizada en Redis:", err)
+		} else {
+			log.Println("✅ Publicado WS: incidencia actualizada evento:", inc.EventoID)
+		}
+	}
+
 	c.JSON(http.StatusOK, inc)
 }
-
 // ─── Tarea ────────────────────────────────────────────────────────────────────
 
 type TareaHandler struct {
