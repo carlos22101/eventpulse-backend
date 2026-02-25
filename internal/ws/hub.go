@@ -113,6 +113,7 @@ func (h *Hub) Run(ctx context.Context) {
 			h.clientes[c.EventoID][c] = true
 			h.mu.Unlock()
 			log.Printf("✅ WS conectado: %s (evento: %s)", c.UsuarioID, c.EventoID)
+			log.Println("🔥 HUB RUNNING")
 
 		case c := <-h.desregistrar:
 			h.mu.Lock()
@@ -142,6 +143,11 @@ func (h *Hub) Publicar(ctx context.Context, eventoID string, evento models.Event
 
 func (h *Hub) escucharRedis(ctx context.Context) {
 	pubsub := h.redis.PSubscribe(ctx, "ep:evento:*")
+	log.Println("👂 Escuchando Redis...")
+
+for msg := range pubsub.Channel() {
+    log.Println("📩 Mensaje recibido de Redis:", msg.Channel)
+}
 	defer pubsub.Close()
 
 	for {
