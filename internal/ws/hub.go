@@ -143,12 +143,9 @@ func (h *Hub) Publicar(ctx context.Context, eventoID string, evento models.Event
 
 func (h *Hub) escucharRedis(ctx context.Context) {
 	pubsub := h.redis.PSubscribe(ctx, "ep:evento:*")
-	log.Println("👂 Escuchando Redis...")
-
-for msg := range pubsub.Channel() {
-    log.Println("📩 Mensaje recibido de Redis:", msg.Channel)
-}
 	defer pubsub.Close()
+
+	log.Println("👂 Escuchando Redis...")
 
 	for {
 		select {
@@ -156,12 +153,17 @@ for msg := range pubsub.Channel() {
 			if !ok {
 				return
 			}
-			// Extraer eventoID del canal "ep:evento:{eventoID}"
+
+			log.Println("📩 Mensaje recibido de Redis:", msg.Channel)
+
 			var evento models.EventoWS
 			if err := json.Unmarshal([]byte(msg.Payload), &evento); err != nil {
+				log.Println("❌ Error deserializando:", err)
 				continue
 			}
+
 			h.distribuir(evento.EventoID, []byte(msg.Payload))
+
 		case <-ctx.Done():
 			return
 		}
