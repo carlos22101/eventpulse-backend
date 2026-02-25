@@ -191,7 +191,7 @@ type EventoWS struct {
 
 type LoginRequest struct {
 	NombreUsuario string `json:"nombre_usuario" binding:"required"`
-	Password      string `json:"password" binding:"required,min=4"`
+	Password_hash     string `json:"password_hash" binding:"required,min=4"`
 }
 
 type LoginResponse struct {

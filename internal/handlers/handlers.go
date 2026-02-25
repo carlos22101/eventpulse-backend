@@ -32,7 +32,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 	usuario, err := h.usuarioRepo.BuscarPorNombreUsuario(c.Request.Context(), req.NombreUsuario)
-	if err != nil || usuario == nil || !h.usuarioRepo.ValidarPassword(usuario.Password, req.Password) {
+	if err != nil || usuario == nil || !h.usuarioRepo.ValidarPassword(usuario.Password, req.Password_hash) {
 		c.JSON(http.StatusUnauthorized, models.ErrorResponse{Error: "Credenciales inválidas"})
 		return
 	}
