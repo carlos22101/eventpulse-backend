@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"strings"
@@ -261,7 +262,6 @@ func (h *ZonaHandler) Eliminar(c *gin.Context) {
 }
 
 // ─── Incidencia ───────────────────────────────────────────────────────────────
-// ─── Incidencia ───────────────────────────────────────────────────────────────
 
 type IncidenciaHandler struct {
 	repo       *repository.IncidenciaRepo
@@ -380,6 +380,7 @@ func (h *IncidenciaHandler) Editar(c *gin.Context) {
 
 	c.JSON(http.StatusOK, inc)
 }
+
 // ─── Tarea ────────────────────────────────────────────────────────────────────
 
 type TareaHandler struct {
@@ -436,11 +437,21 @@ func (h *TareaHandler) Crear(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Error creando tarea"})
 		return
 	}
-	go h.hub.Publicar(ctx, evento.ID, models.EventoWS{
-		Tipo:     models.WSTareaNueva,
-		Payload:  tarea,
-		EventoID: evento.ID,
-	})
+
+	// ✅ FIX: context.Background() para que no muera cuando Gin cancela el ctx de la request
+	eventoIDCopy := evento.ID
+	go func() {
+		if err := h.hub.Publicar(context.Background(), eventoIDCopy, models.EventoWS{
+			Tipo:     models.WSTareaNueva,
+			Payload:  tarea,
+			EventoID: eventoIDCopy,
+		}); err != nil {
+			log.Println("❌ Error publicando tarea nueva en Redis:", err)
+		} else {
+			log.Println("✅ Publicado WS: tarea nueva evento:", eventoIDCopy)
+		}
+	}()
+
 	c.JSON(http.StatusCreated, tarea)
 }
 
@@ -457,11 +468,21 @@ func (h *TareaHandler) Editar(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "Error editando tarea"})
 		return
 	}
-	go h.hub.Publicar(ctx, tarea.EventoID, models.EventoWS{
-		Tipo:     models.WSTareaActualizada,
-		Payload:  tarea,
-		EventoID: tarea.EventoID,
-	})
+
+	// ✅ FIX: context.Background() para que no muera cuando Gin cancela el ctx de la request
+	eventoIDCopy := tarea.EventoID
+	go func() {
+		if err := h.hub.Publicar(context.Background(), eventoIDCopy, models.EventoWS{
+			Tipo:     models.WSTareaActualizada,
+			Payload:  tarea,
+			EventoID: eventoIDCopy,
+		}); err != nil {
+			log.Println("❌ Error publicando tarea actualizada en Redis:", err)
+		} else {
+			log.Println("✅ Publicado WS: tarea actualizada evento:", eventoIDCopy)
+		}
+	}()
+
 	c.JSON(http.StatusOK, tarea)
 }
 
@@ -521,12 +542,17 @@ func (h *ChatHandler) Enviar(c *gin.Context) {
 		return
 	}
 
-	// Distribuir a todos por WS — aquí es donde todos ven nombre + rol
-	go h.hub.Publicar(ctx, eventoID, models.EventoWS{
-		Tipo:     models.WSMensajeNuevo,
-		Payload:  msg,
-		EventoID: eventoID,
-	})
+	// ✅ FIX: context.Background() para que no muera cuando Gin cancela el ctx de la request
+	eventoIDCopy := eventoID
+	go func() {
+		if err := h.hub.Publicar(context.Background(), eventoIDCopy, models.EventoWS{
+			Tipo:     models.WSMensajeNuevo,
+			Payload:  msg,
+			EventoID: eventoIDCopy,
+		}); err != nil {
+			log.Println("❌ Error publicando mensaje en Redis:", err)
+		}
+	}()
 
 	c.JSON(http.StatusCreated, msg)
 }
